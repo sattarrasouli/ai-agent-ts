@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Agent — Professional Roadmap</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #1a1d24;
+      --accent: #6ea8fe;
+      --accent2: #7ee787;
+      --text: #e6e9ef;
+      --muted: #9aa3b2;
+      --border: #2a2f3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem 1rem;
+    }
+    .wrap { max-width: 860px; margin: 0 auto; }
+    h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+    .sub { color: var(--muted); margin-bottom: 2rem; }
+    .tier {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .tier h2 { margin-top: 0; display: flex; align-items: center; gap: 0.5rem; }
+    .badge {
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      background: rgba(110,168,254,0.15);
+      color: var(--accent);
+      border: 1px solid rgba(110,168,254,0.3);
+    }
+    .done .badge { background: rgba(126,231,135,0.15); color: var(--accent2); border-color: rgba(126,231,135,0.3); }
+    .item { margin-bottom: 1rem; }
+    .item h3 { margin: 0 0 0.25rem; font-size: 1.05rem; }
+    .item p { margin: 0; color: var(--muted); }
+    code {
+      background: #0b0d11;
+      padding: 0.1rem 0.4rem;
+      border-radius: 5px;
+      font-size: 0.85em;
+      color: #ffd9a0;
+    }
+    .status {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--accent2);
+      margin-left: auto;
+    }
+    footer { color: var(--muted); font-size: 0.85rem; text-align: center; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AI Agent — Professional Roadmap</h1>
+    <p class="sub">A prioritized plan to evolve the simple LLM-in-a-loop into a production-grade agent.</p>
+
+    <section class="tier done">
+      <h2><span class="badge">Tier 1 — Foundations</span> <span class="status">✓ APPLIED</span></h2>
+      <div class="item">
+        <h3>1. Interactive input loop (REPL)</h3>
+        <p>Replace the hardcoded user message with a <code>readline</code>-based prompt so the agent supports real back-and-forth conversation.</p>
+      </div>
+      <div class="item">
+        <h3>2. Safety on dangerous bits</h3>
+        <p>Replace <code>eval()</code> in the calculator with a safe parser; sandbox <code>read_file</code> / <code>list_directory</code> to the project root so the model can't reach <code>.env</code>, SSH keys, etc.</p>
+      </div>
+      <div class="item">
+        <h3>3. Structured config + model abstraction</h3>
+        <p>Pull base URL, model name, and API key into a typed config object so swapping providers is a one-line change.</p>
+      </div>
+    </section>
+
+    <section class="tier">
+      <h2><span class="badge">Tier 2 — Capability</span></h2>
+      <div class="item">
+        <h3>4. High-value tools</h3>
+        <p><code>write_file</code> / <code>edit_file</code>, <code>run_command</code> (with approval gate), <code>web_search</code> / <code>fetch_url</code>, and cross-file <code>grep</code>.</p>
+      </div>
+      <div class="item">
+        <h3>5. Streaming responses</h3>
+        <p>Set <code>stream: true</code> and render tokens as they arrive for a responsive feel.</p>
+      </div>
+      <div class="item">
+        <h3>6. Human-in-the-loop approval</h3>
+        <p>Confirm (y/n) before running shell commands or writing files — the line between a toy and something trustworthy on a real repo.</p>
+      </div>
+    </section>
+
+    <section class="tier">
+      <h2><span class="badge">Tier 3 — Robustness &amp; Polish</span></h2>
+      <div class="item">
+        <h3>7. Error handling &amp; retries</h3>
+        <p>Retry with backoff on 429/5xx instead of throwing and killing the loop.</p>
+      </div>
+      <div class="item">
+        <h3>8. System prompt</h3>
+        <p>Define the agent's role, tone, and rules via a <code>system</code> message.</p>
+      </div>
+      <div class="item">
+        <h3>9. Token/cost tracking &amp; turn limit</h3>
+        <p>Log <code>usage</code> per response; cap the loop (e.g. 25 iterations) to prevent runaway tool-call loops.</p>
+      </div>
+      <div class="item">
+        <h3>10. Conversation persistence</h3>
+        <p>Save/load message history to disk so sessions survive restarts.</p>
+      </div>
+    </section>
+
+    <footer>Generated for the ai-agent-ts project.</footer>
+  </div>
+</body>
+</html>
