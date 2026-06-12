@@ -1,9 +1,14 @@
-// agent.ts — an interactive LLM-in-a-loop agent with sandboxed tools.
+// agent.ts — an interactive, streaming LLM-in-a-loop agent with sandboxed tools
+// and human-in-the-loop approval for anything that mutates or executes.
 // Run:  set DEEPSEEK_API_KEY in .env   then   npx tsx src/index.ts
 import "dotenv/config"; // load .env so DEEPSEEK_API_KEY is available
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config — everything provider/model specific lives here, so swapping providers
@@ -13,8 +18,9 @@ const config = {
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseUrl: process.env.AGENT_BASE_URL ?? "https://api.deepseek.com/chat/completions",
   model: process.env.AGENT_MODEL ?? "deepseek-v4-flash",
-  // Tools may only read inside this root. Anything outside is rejected.
+  // Tools may only touch paths inside this root. Anything outside is rejected.
   rootDir: path.resolve(process.cwd()),
+  commandTimeoutMs: 30_000,
 };
 
 if (!config.apiKey) {
@@ -22,10 +28,22 @@ if (!config.apiKey) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared readline — used by both the REPL and the approval prompts.
+// ─────────────────────────────────────────────────────────────────────────────
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const ask = (q: string): Promise<string> =>
+  new Promise((resolve) => rl.question(q, resolve));
+
+async function confirm(action: string): Promise<boolean> {
+  const answer = (await ask(`\n[approval] ${action}\n  allow? (y/N) `)).trim().toLowerCase();
+  return answer === "y" || answer === "yes";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Safety helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Resolve a user/model-supplied path and ensure it stays inside rootDir.
+// Resolve a model-supplied path and ensure it stays inside rootDir.
 // Throws on traversal attempts (e.g. "../../etc/passwd" or absolute paths out).
 function safeResolve(p: string): string {
   const resolved = path.resolve(config.rootDir, p);
@@ -80,25 +98,52 @@ function evalArithmetic(expr: string): number {
   return result;
 }
 
+const truncate = (s: string, n = 2000): string =>
+  s.length > n ? s.slice(0, n) + `\n… [truncated, ${s.length} chars total]` : s;
+
+// Recursively walk rootDir collecting text-file paths, skipping noisy dirs.
+function walkFiles(dir: string, acc: string[] = []): string[] {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (["node_modules", ".git", "dist"].includes(entry.name)) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walkFiles(full, acc);
+    else acc.push(full);
+  }
+  return acc;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. The tools the model is allowed to call.
+// Tool registry — schema + implementation in one place. `approvalMessage`, when
+// present, gates the tool behind a y/N confirmation describing the action.
 // ─────────────────────────────────────────────────────────────────────────────
-const tools = [
-  {
-    type: "function",
-    function: {
+type Tool = {
+  schema: { name: string; description: string; parameters: any };
+  approvalMessage?: (args: any) => string;
+  run: (args: any) => string | Promise<string>;
+};
+
+const registry: Record<string, Tool> = {
+  calculator: {
+    schema: {
       name: "calculator",
-      description: "Evaluate a math expression, e.g. '1234 * 5678'",
+      description: "Evaluate a math expression, e.g. '1234 * 5678'.",
       parameters: {
         type: "object",
         properties: { expression: { type: "string" } },
         required: ["expression"],
       },
     },
+    run: ({ expression }) => {
+      try {
+        return String(evalArithmetic(expression));
+      } catch (err: any) {
+        return `Error evaluating '${expression}': ${err.message}`;
+      }
+    },
   },
-  {
-    type: "function",
-    function: {
+
+  get_current_time: {
+    schema: {
       name: "get_current_time",
       description:
         "Get the current date and time. Optionally pass an IANA timezone, e.g. 'America/New_York'.",
@@ -108,10 +153,12 @@ const tools = [
         required: [],
       },
     },
+    run: ({ timezone }) =>
+      new Date().toLocaleString("en-US", timezone ? { timeZone: timezone } : {}),
   },
-  {
-    type: "function",
-    function: {
+
+  read_file: {
+    schema: {
       name: "read_file",
       description: "Read and return the full text contents of a file at the given path.",
       parameters: {
@@ -120,10 +167,17 @@ const tools = [
         required: ["path"],
       },
     },
+    run: ({ path: filePath }) => {
+      try {
+        return fs.readFileSync(safeResolve(filePath), "utf8");
+      } catch (err: any) {
+        return `Error reading '${filePath}': ${err.message}`;
+      }
+    },
   },
-  {
-    type: "function",
-    function: {
+
+  list_directory: {
+    schema: {
       name: "list_directory",
       description: "List the names of files and subdirectories in a directory.",
       parameters: {
@@ -132,48 +186,247 @@ const tools = [
         required: [],
       },
     },
+    run: ({ path: dirPath }) => {
+      const dir = dirPath || ".";
+      try {
+        const entries = fs.readdirSync(safeResolve(dir), { withFileTypes: true });
+        return entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join("\n");
+      } catch (err: any) {
+        return `Error listing '${dir}': ${err.message}`;
+      }
+    },
   },
-];
 
-// Tool implementations, keyed by name. Each takes parsed args and returns a string.
-const toolHandlers: Record<string, (args: any) => string> = {
-  calculator: ({ expression }) => {
-    try {
-      return String(evalArithmetic(expression));
-    } catch (err: any) {
-      return `Error evaluating '${expression}': ${err.message}`;
-    }
+  write_file: {
+    schema: {
+      name: "write_file",
+      description:
+        "Create or overwrite a file with the given content. Parent directories are created as needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Path to write" },
+          content: { type: "string", description: "Full file content" },
+        },
+        required: ["path", "content"],
+      },
+    },
+    approvalMessage: ({ path: p, content }) =>
+      `write_file → ${p} (${(content ?? "").length} chars)`,
+    run: ({ path: filePath, content }) => {
+      try {
+        const target = safeResolve(filePath);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, content ?? "", "utf8");
+        return `Wrote ${(content ?? "").length} chars to '${filePath}'.`;
+      } catch (err: any) {
+        return `Error writing '${filePath}': ${err.message}`;
+      }
+    },
   },
-  get_current_time: ({ timezone }) =>
-    new Date().toLocaleString("en-US", timezone ? { timeZone: timezone } : {}),
-  read_file: ({ path: filePath }) => {
-    try {
-      return fs.readFileSync(safeResolve(filePath), "utf8");
-    } catch (err: any) {
-      return `Error reading '${filePath}': ${err.message}`;
-    }
+
+  edit_file: {
+    schema: {
+      name: "edit_file",
+      description:
+        "Replace an exact substring in a file. `old_string` must appear exactly once.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old_string: { type: "string", description: "Exact text to replace" },
+          new_string: { type: "string", description: "Replacement text" },
+        },
+        required: ["path", "old_string", "new_string"],
+      },
+    },
+    approvalMessage: ({ path: p }) => `edit_file → ${p}`,
+    run: ({ path: filePath, old_string, new_string }) => {
+      try {
+        const target = safeResolve(filePath);
+        const original = fs.readFileSync(target, "utf8");
+        const count = original.split(old_string).length - 1;
+        if (count === 0) return `Error: old_string not found in '${filePath}'.`;
+        if (count > 1) return `Error: old_string appears ${count} times in '${filePath}'; must be unique.`;
+        fs.writeFileSync(target, original.replace(old_string, new_string), "utf8");
+        return `Edited '${filePath}'.`;
+      } catch (err: any) {
+        return `Error editing '${filePath}': ${err.message}`;
+      }
+    },
   },
-  list_directory: ({ path: dirPath }) => {
-    const dir = dirPath || ".";
-    try {
-      const entries = fs.readdirSync(safeResolve(dir), { withFileTypes: true });
-      return entries
-        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-        .join("\n");
-    } catch (err: any) {
-      return `Error listing '${dir}': ${err.message}`;
-    }
+
+  run_command: {
+    schema: {
+      name: "run_command",
+      description:
+        "Run a shell command in the project root and return its stdout/stderr. Times out after 30s.",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+      },
+    },
+    approvalMessage: ({ command }) => `run_command → ${command}`,
+    run: async ({ command }) => {
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          cwd: config.rootDir,
+          timeout: config.commandTimeoutMs,
+          maxBuffer: 1024 * 1024,
+        });
+        return (stdout + (stderr ? `\n[stderr]\n${stderr}` : "")).trim() || "(no output)";
+      } catch (err: any) {
+        return `Command failed: ${err.message}\n${err.stdout ?? ""}${err.stderr ?? ""}`.trim();
+      }
+    },
+  },
+
+  grep: {
+    schema: {
+      name: "grep",
+      description:
+        "Search all project text files for a regex pattern. Returns file:line: matched-line, capped at 100 hits.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "JavaScript regex source" },
+          flags: { type: "string", description: "Optional regex flags, e.g. 'i'" },
+        },
+        required: ["pattern"],
+      },
+    },
+    run: ({ pattern, flags }) => {
+      let re: RegExp;
+      try {
+        re = new RegExp(pattern, flags ?? "");
+      } catch (err: any) {
+        return `Invalid regex: ${err.message}`;
+      }
+      const hits: string[] = [];
+      for (const file of walkFiles(config.rootDir)) {
+        let text: string;
+        try {
+          text = fs.readFileSync(file, "utf8");
+        } catch {
+          continue; // skip binary/unreadable files
+        }
+        const rel = path.relative(config.rootDir, file);
+        const lines = text.split("\n");
+        for (let n = 0; n < lines.length; n++) {
+          if (re.test(lines[n])) {
+            hits.push(`${rel}:${n + 1}: ${lines[n].trim()}`);
+            if (hits.length >= 100) return hits.join("\n") + "\n… [capped at 100 hits]";
+          }
+        }
+      }
+      return hits.length ? hits.join("\n") : "No matches.";
+    },
+  },
+
+  fetch_url: {
+    schema: {
+      name: "fetch_url",
+      description: "HTTP GET a URL and return the response body as text (truncated).",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+      },
+    },
+    run: async ({ url }) => {
+      try {
+        const res = await fetch(url);
+        const body = await res.text();
+        return `HTTP ${res.status}\n${truncate(body, 4000)}`;
+      } catch (err: any) {
+        return `Error fetching '${url}': ${err.message}`;
+      }
+    },
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. The conversation so far (persists across turns within a session).
-// ─────────────────────────────────────────────────────────────────────────────
-const messages: any[] = [];
+const toolSchemas = Object.values(registry).map((t) => ({
+  type: "function",
+  function: t.schema,
+}));
 
-// Run one user turn: feed it to the model, run any tools it asks for, repeat
-// until the model produces a final answer. Returns the assistant's answer text.
-async function runTurn(): Promise<string> {
+// ─────────────────────────────────────────────────────────────────────────────
+// System prompt + conversation state (persists across turns within a session).
+// ─────────────────────────────────────────────────────────────────────────────
+const messages: any[] = [
+  {
+    role: "system",
+    content:
+      "You are a helpful, careful coding agent operating inside a project directory. " +
+      "Use the provided tools to inspect and modify files, run commands, search, and fetch URLs. " +
+      "Prefer reading before writing. Be concise.",
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming: read the SSE response, print assistant tokens live, and assemble
+// any tool calls (whose name/arguments arrive in fragments) by index.
+// ─────────────────────────────────────────────────────────────────────────────
+async function readStream(
+  body: ReadableStream<Uint8Array>,
+): Promise<{ content: string; toolCalls: any[] }> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let headerPrinted = false;
+  const toolCalls: any[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? ""; // keep the trailing partial line
+
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      let json: any;
+      try {
+        json = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const delta = json.choices?.[0]?.delta;
+      if (!delta) continue;
+
+      if (delta.content) {
+        if (!headerPrinted) {
+          process.stdout.write("\nagent › ");
+          headerPrinted = true;
+        }
+        process.stdout.write(delta.content);
+        content += delta.content;
+      }
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          if (!toolCalls[idx]) {
+            toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
+          }
+          if (tc.id) toolCalls[idx].id = tc.id;
+          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+        }
+      }
+    }
+  }
+  if (headerPrinted) process.stdout.write("\n");
+  return { content, toolCalls: toolCalls.filter(Boolean) };
+}
+
+// Run one user turn: stream the model's reply, run any tools it asks for
+// (gated by approval where required), and repeat until it gives a final answer.
+async function runTurn(): Promise<void> {
   while (true) {
     const res = await fetch(config.baseUrl, {
       method: "POST",
@@ -181,44 +434,50 @@ async function runTurn(): Promise<string> {
         "Content-Type": "application/json",
         Authorization: `Bearer ${config.apiKey}`,
       },
-      body: JSON.stringify({ model: config.model, messages, tools }),
+      body: JSON.stringify({ model: config.model, messages, tools: toolSchemas, stream: true }),
     });
-    const data = await res.json();
-    if (!res.ok || !data.choices) {
-      throw new Error(`API error ${res.status}: ${JSON.stringify(data)}`);
-    }
-    const msg = data.choices[0].message;
-    messages.push(msg); // remember what the model said
-
-    if (!msg.tool_calls) {
-      return msg.content; // no tool requested → it's the final answer
+    if (!res.ok || !res.body) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`API error ${res.status}: ${errText}`);
     }
 
-    for (const call of msg.tool_calls) {
-      // run each requested tool by looking it up by name
-      const handler = toolHandlers[call.function.name];
-      const args = JSON.parse(call.function.arguments);
-      const result = handler
-        ? handler(args)
-        : `Error: unknown tool '${call.function.name}'`;
-      console.log(`  ↳ ${call.function.name}(${call.function.arguments}) = ${result}`);
-      messages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content: result,
-      });
+    const { content, toolCalls } = await readStream(res.body);
+
+    const assistantMsg: any = { role: "assistant", content: content || null };
+    if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
+    messages.push(assistantMsg);
+
+    if (!toolCalls.length) return; // final answer already streamed to stdout
+
+    for (const call of toolCalls) {
+      const tool = registry[call.function.name];
+      let args: any = {};
+      try {
+        args = JSON.parse(call.function.arguments || "{}");
+      } catch {
+        /* leave args empty; handler will report */
+      }
+
+      let result: string;
+      if (!tool) {
+        result = `Error: unknown tool '${call.function.name}'`;
+      } else if (tool.approvalMessage && !(await confirm(tool.approvalMessage(args)))) {
+        result = "Denied by user.";
+        console.log(`  ↳ ${call.function.name} — denied`);
+      } else {
+        result = await tool.run(args);
+        console.log(`  ↳ ${call.function.name}(${call.function.arguments}) = ${truncate(result, 200)}`);
+      }
+
+      messages.push({ role: "tool", tool_call_id: call.id, content: result });
     }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Interactive REPL — read user input, run a turn, repeat. Ctrl+C or "exit".
+// Interactive REPL — read user input, run a turn, repeat. "exit"/"quit" or Ctrl+C.
 // ─────────────────────────────────────────────────────────────────────────────
 async function main() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = (q: string): Promise<string> =>
-    new Promise((resolve) => rl.question(q, resolve));
-
   console.log("Agent ready. Type a message, or 'exit' to quit.\n");
 
   while (true) {
@@ -228,8 +487,8 @@ async function main() {
 
     messages.push({ role: "user", content: input });
     try {
-      const answer = await runTurn();
-      console.log(`\nagent › ${answer}\n`);
+      await runTurn();
+      console.log("");
     } catch (err: any) {
       console.error(`\n[error] ${err.message}\n`);
     }
