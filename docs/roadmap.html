@@ -120,6 +120,30 @@
       </div>
     </section>
 
+    <section class="tier">
+      <h2><span class="badge">Tier 4 — Production Hardening</span></h2>
+      <div class="item">
+        <h3>11. Test suite</h3>
+        <p>Unit tests for the arithmetic parser, path sandbox, and each tool handler; an end-to-end test that mocks the API and asserts the tool loop. Wire up a test runner (e.g. <code>vitest</code>) and a <code>test</code> script.</p>
+      </div>
+      <div class="item">
+        <h3>12. Structured logging</h3>
+        <p>Replace ad-hoc <code>console.log</code> with a leveled logger (debug/info/warn/error) and optional JSON output, so tool calls, retries, and token usage are machine-parseable.</p>
+      </div>
+      <div class="item">
+        <h3>13. Multi-provider support</h3>
+        <p>Add request/response adapters so the same agent can target OpenAI, Anthropic, or DeepSeek. The config object is already provider-agnostic — this just needs per-provider payload shaping.</p>
+      </div>
+      <div class="item">
+        <h3>14. Cancellable turns (Ctrl+C)</h3>
+        <p>Wire an <code>AbortController</code> into the fetch + stream reader so Ctrl+C cancels an in-flight turn and returns to the prompt instead of killing the process.</p>
+      </div>
+      <div class="item">
+        <h3>15. Web search</h3>
+        <p>Integrate a search API (deferred from Tier 2) so the agent can discover URLs, not just fetch known ones — pairs with the existing <code>fetch_url</code> tool.</p>
+      </div>
+    </section>
+
     <footer>Generated for the ai-agent-ts project.</footer>
   </div>
 </body>
