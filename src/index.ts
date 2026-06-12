@@ -21,6 +21,9 @@ const config = {
   // Tools may only touch paths inside this root. Anything outside is rejected.
   rootDir: path.resolve(process.cwd()),
   commandTimeoutMs: 30_000,
+  maxRetries: 4, // API retry attempts on 429/5xx/network errors
+  maxToolIterations: 25, // safety cap on tool-call loops within one turn
+  sessionFile: path.resolve(process.cwd(), ".agent-session.json"),
 };
 
 if (!config.apiKey) {
@@ -100,6 +103,45 @@ function evalArithmetic(expr: string): number {
 
 const truncate = (s: string, n = 2000): string =>
   s.length > n ? s.slice(0, n) + `\n… [truncated, ${s.length} chars total]` : s;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Running token totals across the whole session.
+const usageTotal = { prompt: 0, completion: 0 };
+
+// POST to the API, retrying on transient failures (429, 5xx, network errors)
+// with exponential backoff. Throws on non-retryable errors or exhausted retries.
+async function fetchWithRetry(body: string): Promise<Response> {
+  let lastErr: any;
+  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
+    try {
+      const res = await fetch(config.baseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.apiKey}`,
+        },
+        body,
+      });
+      if (res.ok && res.body) return res;
+      // Retry on rate-limit / server errors; fail fast on 4xx (bad request, auth).
+      if (res.status !== 429 && res.status < 500) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`API error ${res.status}: ${errText}`);
+      }
+      lastErr = new Error(`API error ${res.status}`);
+    } catch (err: any) {
+      lastErr = err;
+      if (/API error 4\d\d/.test(err.message)) throw err; // non-retryable
+    }
+    if (attempt < config.maxRetries) {
+      const delay = 500 * 2 ** attempt;
+      console.error(`  [retry] ${lastErr.message} — backing off ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+  throw new Error(`Request failed after ${config.maxRetries + 1} attempts: ${lastErr?.message}`);
+}
 
 // Recursively walk rootDir collecting text-file paths, skipping noisy dirs.
 function walkFiles(dir: string, acc: string[] = []): string[] {
@@ -370,12 +412,13 @@ const messages: any[] = [
 // ─────────────────────────────────────────────────────────────────────────────
 async function readStream(
   body: ReadableStream<Uint8Array>,
-): Promise<{ content: string; toolCalls: any[] }> {
+): Promise<{ content: string; toolCalls: any[]; usage: any }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let content = "";
   let headerPrinted = false;
+  let usage: any = null;
   const toolCalls: any[] = [];
 
   while (true) {
@@ -396,6 +439,7 @@ async function readStream(
       } catch {
         continue;
       }
+      if (json.usage) usage = json.usage; // final chunk carries token usage
       const delta = json.choices?.[0]?.delta;
       if (!delta) continue;
 
@@ -421,27 +465,38 @@ async function readStream(
     }
   }
   if (headerPrinted) process.stdout.write("\n");
-  return { content, toolCalls: toolCalls.filter(Boolean) };
+  return { content, toolCalls: toolCalls.filter(Boolean), usage };
 }
 
 // Run one user turn: stream the model's reply, run any tools it asks for
 // (gated by approval where required), and repeat until it gives a final answer.
 async function runTurn(): Promise<void> {
-  while (true) {
-    const res = await fetch(config.baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify({ model: config.model, messages, tools: toolSchemas, stream: true }),
-    });
-    if (!res.ok || !res.body) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`API error ${res.status}: ${errText}`);
+  for (let iter = 0; ; iter++) {
+    if (iter >= config.maxToolIterations) {
+      console.error(`\n[limit] stopped after ${config.maxToolIterations} tool iterations.`);
+      return;
     }
 
-    const { content, toolCalls } = await readStream(res.body);
+    const res = await fetchWithRetry(
+      JSON.stringify({
+        model: config.model,
+        messages,
+        tools: toolSchemas,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+    );
+
+    const { content, toolCalls, usage } = await readStream(res.body!);
+
+    if (usage) {
+      usageTotal.prompt += usage.prompt_tokens ?? 0;
+      usageTotal.completion += usage.completion_tokens ?? 0;
+      console.log(
+        `  [tokens] +${usage.prompt_tokens ?? 0} in / +${usage.completion_tokens ?? 0} out` +
+          ` · session ${usageTotal.prompt}/${usageTotal.completion}`,
+      );
+    }
 
     const assistantMsg: any = { role: "assistant", content: content || null };
     if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
@@ -475,19 +530,65 @@ async function runTurn(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Interactive REPL — read user input, run a turn, repeat. "exit"/"quit" or Ctrl+C.
+// Persistence — save/load conversation history so sessions survive restarts.
+// Only the system message is kept on reset; the file lives in the project root.
+// ─────────────────────────────────────────────────────────────────────────────
+function saveSession(): void {
+  try {
+    fs.writeFileSync(config.sessionFile, JSON.stringify(messages, null, 2), "utf8");
+  } catch (err: any) {
+    console.error(`  [warn] could not save session: ${err.message}`);
+  }
+}
+
+function loadSession(): void {
+  if (!fs.existsSync(config.sessionFile)) return;
+  try {
+    const saved = JSON.parse(fs.readFileSync(config.sessionFile, "utf8"));
+    if (Array.isArray(saved) && saved.length) {
+      messages.length = 0;
+      messages.push(...saved);
+      const turns = saved.filter((m: any) => m.role === "user").length;
+      console.log(`Resumed previous session (${turns} prior message(s)).`);
+    }
+  } catch (err: any) {
+    console.error(`  [warn] could not load session: ${err.message}`);
+  }
+}
+
+function resetSession(): void {
+  messages.length = 1; // keep only the system prompt
+  usageTotal.prompt = 0;
+  usageTotal.completion = 0;
+  try {
+    if (fs.existsSync(config.sessionFile)) fs.unlinkSync(config.sessionFile);
+  } catch {
+    /* ignore */
+  }
+  console.log("Session reset.");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interactive REPL — read user input, run a turn, repeat.
+// Commands: "exit"/"quit" to leave, "reset" to clear history.
 // ─────────────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log("Agent ready. Type a message, or 'exit' to quit.\n");
+  loadSession();
+  console.log("Agent ready. Type a message, 'reset' to clear, or 'exit' to quit.\n");
 
   while (true) {
     const input = (await ask("you › ")).trim();
     if (!input) continue;
     if (input === "exit" || input === "quit") break;
+    if (input === "reset") {
+      resetSession();
+      continue;
+    }
 
     messages.push({ role: "user", content: input });
     try {
       await runTurn();
+      saveSession();
       console.log("");
     } catch (err: any) {
       console.error(`\n[error] ${err.message}\n`);
