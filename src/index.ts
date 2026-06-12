@@ -7,19 +7,41 @@ if (!API_KEY) {
   throw new Error("DEEPSEEK_API_KEY is not set. Add it to your .env file.");
 }
 
-// 1. One tool the model is allowed to call.
-const tools = [{
-  type: "function",
-  function: {
-    name: "calculator",
-    description: "Evaluate a math expression, e.g. '1234 * 5678'",
-    parameters: {
-      type: "object",
-      properties: { expression: { type: "string" } },
-      required: ["expression"],
+// 1. The tools the model is allowed to call.
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "calculator",
+      description: "Evaluate a math expression, e.g. '1234 * 5678'",
+      parameters: {
+        type: "object",
+        properties: { expression: { type: "string" } },
+        required: ["expression"],
+      },
     },
   },
-}];
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description:
+        "Get the current date and time. Optionally pass an IANA timezone, e.g. 'America/New_York'.",
+      parameters: {
+        type: "object",
+        properties: { timezone: { type: "string" } },
+        required: [],
+      },
+    },
+  },
+];
+
+// Tool implementations, keyed by name. Each takes parsed args and returns a string.
+const toolHandlers: Record<string, (args: any) => string> = {
+  calculator: ({ expression }) => String(eval(expression)), // demo only, never on real input
+  get_current_time: ({ timezone }) =>
+    new Date().toLocaleString("en-US", timezone ? { timeZone: timezone } : {}),
+};
 
 // 2. The conversation so far.
 const messages: any[] = [
@@ -37,23 +59,28 @@ async function main() {
       },
       body: JSON.stringify({ model: "deepseek-v4-flash", messages, tools }),
     });
-
+    console.log("res", res);
     const data = await res.json();
     if (!res.ok || !data.choices) {
       throw new Error(`API error ${res.status}: ${JSON.stringify(data)}`);
     }
     const msg = data.choices[0].message;
-    messages.push(msg);                 // remember what the model said
+    messages.push(msg); // remember what the model said
 
-    if (!msg.tool_calls) {              // no tool requested → it's done
+    if (!msg.tool_calls) {
+      // no tool requested → it's done
       console.log("\nAnswer:", msg.content);
       return;
     }
 
-    for (const call of msg.tool_calls) {           // run each requested tool
-      const { expression } = JSON.parse(call.function.arguments);
-      const result = String(eval(expression));     // demo only, never on real input
-      console.log(`calculator("${expression}") = ${result}`);
+    for (const call of msg.tool_calls) {
+      // run each requested tool by looking it up by name
+      const handler = toolHandlers[call.function.name];
+      const args = JSON.parse(call.function.arguments);
+      const result = handler
+        ? handler(args)
+        : `Error: unknown tool '${call.function.name}'`;
+      console.log(`${call.function.name}(${call.function.arguments}) = ${result}`);
       messages.push({
         role: "tool",
         tool_call_id: call.id,
