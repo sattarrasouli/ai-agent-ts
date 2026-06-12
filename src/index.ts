@@ -1,6 +1,7 @@
 // agent.ts — the simplest possible agent: an LLM in a loop with one tool.
 // Run:  set DEEPSEEK_API_KEY in .env   then   npx tsx src/index.ts
 import "dotenv/config"; // load .env so DEEPSEEK_API_KEY is available
+import * as fs from "fs";
 
 const API_KEY = process.env.DEEPSEEK_API_KEY;
 if (!API_KEY) {
@@ -34,6 +35,30 @@ const tools = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read and return the full text contents of a file at the given path.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string", description: "Path to the file to read" } },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_directory",
+      description: "List the names of files and subdirectories in a directory.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string", description: "Directory path (defaults to '.')" } },
+        required: [],
+      },
+    },
+  },
 ];
 
 // Tool implementations, keyed by name. Each takes parsed args and returns a string.
@@ -41,6 +66,24 @@ const toolHandlers: Record<string, (args: any) => string> = {
   calculator: ({ expression }) => String(eval(expression)), // demo only, never on real input
   get_current_time: ({ timezone }) =>
     new Date().toLocaleString("en-US", timezone ? { timeZone: timezone } : {}),
+  read_file: ({ path: filePath }) => {
+    try {
+      return fs.readFileSync(filePath, "utf8");
+    } catch (err: any) {
+      return `Error reading '${filePath}': ${err.message}`;
+    }
+  },
+  list_directory: ({ path: dirPath }) => {
+    const dir = dirPath || ".";
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      return entries
+        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+        .join("\n");
+    } catch (err: any) {
+      return `Error listing '${dir}': ${err.message}`;
+    }
+  },
 };
 
 // 2. The conversation so far.
